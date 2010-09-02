@@ -24,7 +24,6 @@
 #include <psapi.h>
 #include <stdlib.h>
 #include <stdio.h>
-#include <assert.h>
 #include <stdarg.h>
 #include <string.h>
 #include <stdbool.h>
@@ -34,6 +33,12 @@
 struct bfd_ctx {
 	bfd * handle;
 	asymbol ** symbol;
+};
+
+struct bfd_set {
+	char * name;
+	struct bfd_ctx * bc;
+	struct bfd_set *next;
 };
 
 struct find_info {
@@ -76,8 +81,6 @@ output_print(struct output_buffer *ob, const char * format, ...)
 static void 
 lookup_section(bfd *abfd, asection *sec, void *opaque_data)
 {
-	assert(sec);
-	assert(opaque_data);
 	struct find_info *data = opaque_data;
 
 	if (data->func)
@@ -117,18 +120,14 @@ find(struct bfd_ctx * b, DWORD offset, const char **file, const char **func, uns
 }
 
 static int
-init_bfd_ctx(struct bfd_ctx *bc, struct output_buffer *ob)
+init_bfd_ctx(struct bfd_ctx *bc, const char * procname, struct output_buffer *ob)
 {
 	bc->handle = NULL;
 	bc->symbol = NULL;
 
-	char procname[MAX_PATH];
-	GetModuleFileNameA(NULL, procname, sizeof procname);
-
-	bfd_init();
 	bfd *b = bfd_openr(procname, 0);
 	if (!b) {
-		output_print(ob,"Failed to init bfd\n");
+		output_print(ob,"Failed to open bfd from (%s)\n" , procname);
 		return 1;
 	}
 
@@ -138,7 +137,7 @@ init_bfd_ctx(struct bfd_ctx *bc, struct output_buffer *ob)
 
 	if (!(r1 && r2 && r3)) {
 		bfd_close(b);
-		output_print(ob,"Failed to init bfd\n");
+		output_print(ob,"Failed to init bfd from (%s)\n", procname);
 		return 1;
 	}
 
@@ -149,7 +148,7 @@ init_bfd_ctx(struct bfd_ctx *bc, struct output_buffer *ob)
 		if (bfd_read_minisymbols(b, TRUE, &symbol_table, &dummy) < 0) {
 			free(symbol_table);
 			bfd_close(b);
-			output_print(ob,"Failed to init bfd\n");
+			output_print(ob,"Failed to read symbols from (%s)\n", procname);
 			return 1;
 		}
 	}
@@ -171,11 +170,46 @@ close_bfd_ctx(struct bfd_ctx *bc)
 	}
 }
 
-static void
-_backtrace(struct output_buffer *ob, struct bfd_ctx *bc, int depth , LPCONTEXT context)
+static struct bfd_ctx *
+get_bc(struct output_buffer *ob , struct bfd_set *set , const char *procname)
 {
-	if (init_bfd_ctx(bc,ob))
-		return;
+	while(set->name) {
+		if (strcmp(set->name , procname) == 0) {
+			return set->bc;
+		}
+		set = set->next;
+	}
+	struct bfd_ctx bc;
+	if (init_bfd_ctx(&bc, procname , ob)) {
+		return NULL;
+	}
+	set->next = calloc(1, sizeof(*set));
+	set->bc = malloc(sizeof(struct bfd_ctx));
+	memcpy(set->bc, &bc, sizeof(bc));
+	set->name = strdup(procname);
+
+	return set->bc;
+}
+
+static void
+release_set(struct bfd_set *set)
+{
+	while(set->next) {
+		struct bfd_set * temp = set->next;
+		free(set->name);
+		close_bfd_ctx(set->bc);
+		free(set);
+		set = temp;
+	}
+}
+
+static void
+_backtrace(struct output_buffer *ob, struct bfd_set *set, int depth , LPCONTEXT context)
+{
+	char procname[MAX_PATH];
+	GetModuleFileNameA(NULL, procname, sizeof procname);
+
+	struct bfd_ctx *bc = NULL;
 
 	STACKFRAME frame;
 	memset(&frame,0,sizeof(frame));
@@ -214,14 +248,18 @@ _backtrace(struct output_buffer *ob, struct bfd_ctx *bc, int depth , LPCONTEXT c
 
 		const char * module_name = "[unknown module]";
 		if (module_base && 
-			GetModuleFileNameA((HINSTANCE)module_base, module_name_raw, MAX_PATH))
+			GetModuleFileNameA((HINSTANCE)module_base, module_name_raw, MAX_PATH)) {
 			module_name = module_name_raw;
+			bc = get_bc(ob, set, module_name);
+		}
 
-		const char * file;
-		const char * func;
-		unsigned line;
+		const char * file = NULL;
+		const char * func = NULL;
+		unsigned line = 0;
 
-		find(bc,frame.AddrPC.Offset,&file,&func,&line);
+		if (bc) {
+			find(bc,frame.AddrPC.Offset,&file,&func,&line);
+		}
 
 		if (file == NULL) {
 			DWORD dummy = 0;
@@ -233,15 +271,19 @@ _backtrace(struct output_buffer *ob, struct bfd_ctx *bc, int depth , LPCONTEXT c
 			}
 		}
 		if (func == NULL) {
-			func = "[unknown func]";
+			output_print(ob,"0x%x : %s : %s \n", 
+				frame.AddrPC.Offset,
+				module_name,
+				file);
 		}
-
-		output_print(ob,"0x%x : %s : %s (%d) : in function (%s) \n", 
-			frame.AddrPC.Offset,
-			module_name,
-			file,
-			line,
-			func);
+		else {
+			output_print(ob,"0x%x : %s : %s (%d) : in function (%s) \n", 
+				frame.AddrPC.Offset,
+				module_name,
+				file,
+				line,
+				func);
+		}
 	}
 }
 
@@ -258,9 +300,10 @@ exception_filter(LPEXCEPTION_POINTERS info)
 		output_print(&ob,"Failed to init symbol context\n");
 	}
 	else {
-		struct bfd_ctx bc;
-		_backtrace(&ob , &bc , 128 , info->ContextRecord);
-		close_bfd_ctx(&bc);
+		bfd_init();
+		struct bfd_set *set = calloc(1,sizeof(*set));
+		_backtrace(&ob , set , 128 , info->ContextRecord);
+		release_set(set);
 
 		SymCleanup(GetCurrentProcess());
 	}
