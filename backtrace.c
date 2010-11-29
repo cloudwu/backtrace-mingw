@@ -162,11 +162,13 @@ init_bfd_ctx(struct bfd_ctx *bc, const char * procname, struct output_buffer *ob
 static void
 close_bfd_ctx(struct bfd_ctx *bc)
 {
-	if (bc->symbol) {
-		free(bc->symbol);
-	}
-	if (bc->handle) {
-		bfd_close(bc->handle);
+	if (bc) {
+		if (bc->symbol) {
+			free(bc->symbol);
+		}
+		if (bc->handle) {
+			bfd_close(bc->handle);
+		}
 	}
 }
 
@@ -194,7 +196,7 @@ get_bc(struct output_buffer *ob , struct bfd_set *set , const char *procname)
 static void
 release_set(struct bfd_set *set)
 {
-	while(set->next) {
+	while(set) {
 		struct bfd_set * temp = set->next;
 		free(set->name);
 		close_bfd_ctx(set->bc);
